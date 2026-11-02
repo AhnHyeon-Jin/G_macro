@@ -159,21 +159,22 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
         self.transient(app.root)
         self.resizable(False, False)
 
-        offset = rule.get("offset", [0, 0])
+        offset = macro.offset_ranges(rule)
         self.v_name = tk.StringVar(value=rule.get("name", ""))
         self.v_trigger = tk.StringVar(value=rule.get("trigger", ""))
         self.v_target = tk.StringVar(value=rule.get("target", ""))
         alarms = macro.rule_alarm_paths(rule)
         self.v_alarms = [tk.StringVar(value=alarms[i] if i < len(alarms) else "") for i in range(RULE_ALARM_SLOTS)]
         self.v_threshold = tk.DoubleVar(value=rule.get("threshold", 0.85))
-        self.v_off_x = tk.StringVar(value=str(offset[0]))
-        self.v_off_y = tk.StringVar(value=str(offset[1]))
+        self.v_off = [(tk.StringVar(value=str(lo)), tk.StringVar(value=str(hi))) for lo, hi in offset]  # X, Y
         self.v_cooldown = tk.StringVar(value=str(rule["cooldown"]) if "cooldown" in rule else "")
         hold = rule.get("hold", macro.DEFAULT_HOLD)
         gap = rule.get("gap", macro.DEFAULT_GAP)
+        delay = rule.get("delay", macro.DEFAULT_DELAY)
         self.v_clicks = tk.StringVar(value=str(rule.get("clicks", 1)))
         self.v_hold = (tk.StringVar(value=str(hold[0])), tk.StringVar(value=str(hold[1])))
         self.v_gap = (tk.StringVar(value=str(gap[0])), tk.StringVar(value=str(gap[1])))
+        self.v_delay = (tk.StringVar(value=str(delay[0])), tk.StringVar(value=str(delay[1])))
 
         frm = ttk.Frame(self, padding=12)
         frm.grid(sticky="nsew")
@@ -205,18 +206,21 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
         ttk.Label(frm, text="클릭 위치 보정").grid(row=13, column=0, sticky="w", pady=3)
         off_frm = ttk.Frame(frm)
         off_frm.grid(row=13, column=1, columnspan=3, sticky="w")
-        ttk.Label(off_frm, text="X").pack(side="left")
-        ttk.Spinbox(off_frm, from_=-2000, to=2000, textvariable=self.v_off_x, width=6).pack(side="left", padx=(2, 10))
-        ttk.Label(off_frm, text="Y").pack(side="left")
-        ttk.Spinbox(off_frm, from_=-2000, to=2000, textvariable=self.v_off_y, width=6).pack(side="left", padx=2)
-        ttk.Label(off_frm, text="(타깃 가운데 기준, 픽셀)", foreground="gray").pack(side="left", padx=6)
+        for axis, (v_min, v_max) in zip("XY", self.v_off):
+            ttk.Label(off_frm, text=axis).pack(side="left", padx=(0 if axis == "X" else 12, 2))
+            ttk.Entry(off_frm, textvariable=v_min, width=5).pack(side="left")
+            ttk.Label(off_frm, text="~").pack(side="left", padx=2)
+            ttk.Entry(off_frm, textvariable=v_max, width=5).pack(side="left")
+        ttk.Label(off_frm, text="타깃 가운데 기준 픽셀, 범위에서 랜덤 (X+ 오른쪽, Y+ 아래)",
+                  foreground="gray").pack(side="left", padx=6)
 
-        ttk.Label(frm, text="클릭 횟수").grid(row=14, column=0, sticky="w", pady=3)
-        ttk.Spinbox(frm, from_=1, to=100, textvariable=self.v_clicks, width=6).grid(row=14, column=1, sticky="w")
+        ttk.Label(frm, text="클릭 횟수").grid(row=15, column=0, sticky="w", pady=3)
+        ttk.Spinbox(frm, from_=1, to=100, textvariable=self.v_clicks, width=6).grid(row=15, column=1, sticky="w")
 
         for r, label, (v_min, v_max), hint in (
-            (15, "누르는 시간(초)", self.v_hold, "누른 뒤 이 범위에서 랜덤하게 기다렸다가 뗌"),
-            (16, "클릭 간격(초)", self.v_gap, "여러 번 클릭할 때 뗀 뒤 다음 누르기까지"),
+            (14, "반응 대기(초)", self.v_delay, "발견 후 랜덤하게 기다렸다가 다시 확인하고 클릭 (0 = 바로)"),
+            (16, "누르는 시간(초)", self.v_hold, "누른 뒤 이 범위에서 랜덤하게 기다렸다가 뗌"),
+            (17, "클릭 간격(초)", self.v_gap, "여러 번 클릭할 때 뗀 뒤 다음 누르기까지"),
         ):
             ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w", pady=3)
             rng = ttk.Frame(frm)
@@ -226,13 +230,13 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
             ttk.Entry(rng, textvariable=v_max, width=6).pack(side="left")
             ttk.Label(rng, text=hint, foreground="gray").pack(side="left", padx=6)
 
-        ttk.Label(frm, text="쿨다운(초)").grid(row=17, column=0, sticky="w", pady=3)
+        ttk.Label(frm, text="쿨다운(초)").grid(row=18, column=0, sticky="w", pady=3)
         cd_frm = ttk.Frame(frm)
-        cd_frm.grid(row=17, column=1, columnspan=3, sticky="w")
+        cd_frm.grid(row=18, column=1, columnspan=3, sticky="w")
         ttk.Entry(cd_frm, textvariable=self.v_cooldown, width=8).pack(side="left")
         ttk.Label(cd_frm, text="비우면 설정 탭의 기본값 사용", foreground="gray").pack(side="left", padx=6)
 
-        self._add_ok_cancel(frm, 18)
+        self._add_ok_cancel(frm, 19)
         self.grab_set()
 
     def _capture_index(self):
@@ -252,9 +256,16 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
                 "trigger": trigger,
                 "target": target,
                 "threshold": round(self.v_threshold.get(), 2),
-                "offset": [parse_number(self.v_off_x.get(), int, "보정 X"),
-                           parse_number(self.v_off_y.get(), int, "보정 Y")],
             }
+            offset = []
+            for axis, (v_min, v_max) in zip("XY", self.v_off):
+                lo = parse_number(v_min.get(), int, f"보정 {axis} 최소")
+                hi = parse_number(v_max.get(), int, f"보정 {axis} 최대")
+                if lo > hi:
+                    raise ValueError(f"클릭 위치 보정 {axis}: 최소가 최대보다 큽니다.")
+                offset.append([lo, hi])
+            # 범위가 없으면 예전처럼 [x, y]로 저장
+            rule["offset"] = [lo for lo, _ in offset] if all(lo == hi for lo, hi in offset) else offset
             alarms = [v.get().strip() for v in self.v_alarms if v.get().strip()]
             for alarm in alarms:
                 if not (macro.BASE_DIR / alarm).is_file():
@@ -267,7 +278,8 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
             if len(selected) < len(self.v_ovs):
                 rule["overlays"] = selected  # 전체 선택이면 생략 (오버레이를 추가해도 자동 적용)
             rule["clicks"] = parse_number(self.v_clicks.get(), int, "클릭 횟수", 1)
-            for key, label, (v_min, v_max) in (("hold", "누르는 시간", self.v_hold), ("gap", "클릭 간격", self.v_gap)):
+            for key, label, (v_min, v_max) in (("delay", "반응 대기", self.v_delay), ("hold", "누르는 시간", self.v_hold),
+                                               ("gap", "클릭 간격", self.v_gap)):
                 lo = parse_number(v_min.get(), float, f"{label} 최소", 0)
                 hi = parse_number(v_max.get(), float, f"{label} 최대", 0)
                 if lo > hi:

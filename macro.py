@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
 # 규칙에 hold / gap 이 없을 때 쓰는 기본 범위 (초)
 DEFAULT_HOLD = [0.05, 0.1]
 DEFAULT_GAP = [0.1, 0.2]
+DEFAULT_DELAY = [0.0, 0.0]  # 트리거·타깃 발견 후 클릭까지 대기. 0이면 바로 클릭
 
 
 class MacroError(Exception):
@@ -118,6 +119,11 @@ def rule_alarm_paths(rule):
     """규칙의 알람 이미지 경로 목록. 이전 버전은 문자열 하나로 저장했으므로 둘 다 받음."""
     alarm = rule.get("alarm") or []
     return [alarm] if isinstance(alarm, str) else [a for a in alarm if a]
+
+
+def offset_ranges(rule):
+    """클릭 위치 보정 [[x최소, x최대], [y최소, y최대]]. 고정값 [x, y]로 저장된 것도 받음."""
+    return [sorted(v) if isinstance(v, (list, tuple)) else [v, v] for v in rule.get("offset", [0, 0])]
 
 
 def load_image(path):
@@ -309,10 +315,11 @@ class Macro:
                 "trigger": load_image(r["trigger"]),
                 "target": load_image(r["target"]),
                 "threshold": r.get("threshold", 0.85),
-                "offset": r.get("offset", [0, 0]),
+                "offset": offset_ranges(r),
                 "clicks": max(1, int(r.get("clicks", 1))),
                 "hold": sorted(r.get("hold", DEFAULT_HOLD)),
                 "gap": sorted(r.get("gap", DEFAULT_GAP)),
+                "delay": sorted(r.get("delay", DEFAULT_DELAY)),
                 "cooldown": r.get("cooldown", cfg.get("cooldown", 1.0)),
                 "boxes": boxes,
                 "last": [0.0] * len(self.boxes),  # 오버레이별 쿨다운
@@ -397,7 +404,7 @@ class Macro:
             for rule in self.rules:
                 if self.stop_event.is_set() or not self.running.is_set():
                     return
-                if bi in rule["boxes"] and self._check_rule(rule, bi, screen):
+                if bi in rule["boxes"] and self._check_rule(rule, bi, screen, sct):
                     screen = self._grab(sct, bi)  # 클릭으로 화면이 바뀌었으니 다음 규칙은 새 화면으로
 
     def _check_alarms(self, bi, screen):
@@ -417,35 +424,72 @@ class Macro:
             return True
         return False
 
-    def _check_rule(self, rule, bi, screen):
-        """클릭했으면 True."""
-        box = self.boxes[bi]
-        tag = f"[{bi + 1}] {rule['name']}" if len(self.boxes) > 1 else rule["name"]
-        if time.time() - rule["last"][bi] < rule["cooldown"]:
-            return False
+    def _wait(self, seconds):
+        """seconds 동안 대기. 도중에 정지되면 False."""
+        end = time.time() + seconds
+        while (left := end - time.time()) > 0:
+            if self.stop_event.is_set() or not self.running.is_set():
+                return False
+            time.sleep(min(0.05, left))
+        return True
+
+    def _find_target(self, rule, bi, screen):
+        """트리거가 보이면 가운데와 가장 가까운 타깃 (위치, 설명). 없으면 None."""
+        tag = self._tag(rule, bi)
         trig_pos, trig_score = find(screen, rule["trigger"], rule["threshold"])
         if trig_pos is None:
             if self.debug:
                 self.log(f"{tag}: 트리거 없음 (점수 {trig_score:.2f})")
-            return False
+            return None
         targets = find_all(screen, rule["target"], rule["threshold"])
         if not targets:
             if self.debug:
                 self.log(f"{tag}: 트리거 감지, 타깃 없음")
-            return False
+            return None
         # 검색 영역 가운데(내 캐릭터 위치)와 가장 가까운 타깃 선택
+        box = self.boxes[bi]
         cx, cy = box["width"] / 2, box["height"] / 2
         tgt_pos, tgt_score = min(targets, key=lambda t: (t[0][0] - cx) ** 2 + (t[0][1] - cy) ** 2)
         dist = ((tgt_pos[0] - cx) ** 2 + (tgt_pos[1] - cy) ** 2) ** 0.5
-        detail = f"타깃 {len(targets)}개 중 가운데와 최단 {dist:.0f}px ({tgt_score:.2f})"
+        return tgt_pos, (f"트리거 {trig_score:.2f} / 타깃 {len(targets)}개 중 가운데와 최단 {dist:.0f}px "
+                         f"({tgt_score:.2f})")
 
-        x = box["left"] + tgt_pos[0] + rule["offset"][0]
-        y = box["top"] + tgt_pos[1] + rule["offset"][1]
+    def _tag(self, rule, bi):
+        return f"[{bi + 1}] {rule['name']}" if len(self.boxes) > 1 else rule["name"]
+
+    def _check_rule(self, rule, bi, screen, sct):
+        """클릭했으면 True."""
+        if time.time() - rule["last"][bi] < rule["cooldown"]:
+            return False
+        found = self._find_target(rule, bi, screen)
+        if found is None:
+            return False
+
+        if rule["delay"][1] > 0:
+            # 반응 대기 후 다시 캡처해서 트리거가 아직 있는지, 타깃이 어디 있는지 새로 확인
+            wait = random.uniform(*rule["delay"])
+            if not self._wait(wait):
+                return False
+            screen = self._grab(sct, bi)
+            if self._check_alarms(bi, screen):
+                return False
+            found = self._find_target(rule, bi, screen)
+            if found is None:
+                self.log(f"{self._tag(rule, bi)}: {wait:.2f}초 대기 후 트리거/타깃이 사라져 클릭 안 함")
+                return False
+            found = (found[0], f"{found[1]} / {wait:.2f}초 대기")
+
+        tgt_pos, detail = found
+        box = self.boxes[bi]
+        (x_lo, x_hi), (y_lo, y_hi) = rule["offset"]
+        x = box["left"] + tgt_pos[0] + random.randint(x_lo, x_hi)
+        y = box["top"] + tgt_pos[1] + random.randint(y_lo, y_hi)
         if not right_click(self.mouse, x, y, self.return_cursor, rule["clicks"], rule["hold"], rule["gap"]):
             self.log("입력 실패 - 게임이 관리자 권한이면 매크로도 관리자로 실행하세요")
         rule["last"][bi] = time.time()
-        self.log(f"{tag}: 우클릭 {rule['clicks']}회 ({x}, {y})  트리거 {trig_score:.2f} / {detail}")
+        self.log(f"{self._tag(rule, bi)}: 우클릭 {rule['clicks']}회 ({x}, {y})  {detail}")
         return True
+
 
 def main():
     cfg = load_config()
