@@ -1,0 +1,45 @@
+{
+  "monitor": 1,
+  "regions": [
+    [
+      -2708,
+      514,
+      1280,
+      720
+    ],
+    [
+      -2850,
+      1314,
+      1280,
+      720
+    ],
+    [
+      -1382,
+      554,
+      1280,
+      720
+    ]
+  ],
+  "interval": 0.2,
+  "cooldown": 1.0,
+  "return_cursor": false,
+  "input": "dd",
+  "dd_dll": "dd/dd63330.dll",
+  "start_key": "f8",
+  "stop_key": "f12",
+  "exit_key": null,
+  "debug": false,
+  "overlay": true,
+  "rules": [
+    {
+      "name": "예시",
+      "trigger": "images/trigger.png",
+      "target": "images/target.png",
+      "threshold": 0.85,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  ]
+}

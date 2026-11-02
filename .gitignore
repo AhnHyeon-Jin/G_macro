@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller (build.bat)
+build/
+dist/
+*.spec
+
+# DD 드라이버 DLL은 직접 받아서 dd/ 에 넣음 (README 참고)
+dd/
+dll/
+*.dll
+
+# 점수 테스트 도구가 캡처한 화면
+tests/
+
+# DD 샘플 (개인 경로 포함)
+dll_button.py
