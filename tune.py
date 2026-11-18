@@ -1,7 +1,8 @@
 """
 일치 기준(threshold) 정하는 도구.
 
-템플릿(트리거/타깃/알람 이미지)과 테스트 이미지들의 매칭 점수를 매크로와 같은 방식으로 계산한다.
+템플릿(트리거/타깃/알람 이미지, 여러 장 가능)과 테스트 이미지들의 매칭 점수를 매크로와 같은 방식으로 계산한다.
+(투명 PNG 마스크, 좌우 반전, 검색 배율 포함)
 테스트 이미지마다 "있음/없음"을 표시하면 두 그룹을 가르는 추천 기준을 알려준다.
 단독 실행: python tune.py  /  GUI 규칙·알람 편집 창의 "점수 테스트" 버튼
 """
@@ -42,6 +43,24 @@ def to_photo(bgr, max_w, max_h):
     return tk.PhotoImage(data=data), scale
 
 
+def bgra_to_photo(bgra, max_w, max_h, bg=(60, 60, 60)):
+    """투명 PNG(BGRA)를 bg 색 위에 합성해 PhotoImage로."""
+    if bgra.ndim == 3 and bgra.shape[2] == 4:
+        a = bgra[:, :, 3:4] / 255.0
+        bgra = (bgra[:, :, :3] * a + np.array(bg, np.float64) * (1 - a)).astype(np.uint8)
+    elif bgra.ndim == 2:
+        bgra = cv2.cvtColor(bgra, cv2.COLOR_GRAY2BGR)
+    return to_photo(bgra, max_w, max_h)[0]
+
+
+def read_unchanged(path):
+    """미리보기용: 투명도 포함해서 읽기."""
+    img = cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise ValueError(f"이미지를 읽을 수 없습니다: {path}")
+    return img
+
+
 def recommend(samples):
     """samples: [(정답, 최고점수)]. (추천 기준 또는 None, 설명) 반환."""
     pos = [s for label, s in samples if label is True]
@@ -68,25 +87,28 @@ def recommend(samples):
 
 class ThresholdTool(tk.Toplevel):
     """
-    templates: [(이름, 경로)] 고를 수 있는 템플릿 목록
+    templates: [(이름, [경로, ...], 좌우반전 여부)] 고를 수 있는 템플릿 묶음 목록
+    scale: 검색 배율 (매크로 설정과 같게)
     regions: 오버레이 영역 [[x, y, w, h], ...] (화면 캡처용)
     hide_windows: 캡처할 때 숨길 창 목록을 돌려주는 함수 (GUI 본창, 오버레이 등)
     on_apply: on_apply(기준) - "기준 적용" 버튼을 누르면 호출
     """
 
-    def __init__(self, master, templates=(), threshold=0.85, regions=None, hide_windows=None, on_apply=None):
+    def __init__(self, master, templates=(), threshold=0.85, regions=None, hide_windows=None, on_apply=None,
+                 scale=1.0):
         super().__init__(master)
         self.title("점수 테스트 - 일치 기준 정하기")
         self.minsize(900, 560)
         self.regions = regions or []
         self.hide_windows = hide_windows
         self.on_apply = on_apply
-        self.template = None  # 흑백 템플릿
-        self.samples = []  # {"path", "color", "gray", "res", "best", "label"}
+        self.scale = scale
+        self.templates = []  # 현재 묶음의 macro.Template 목록 (검색 배율 적용)
+        self.samples = []  # {"path", "color", "gray", "res": [(템플릿, 결과)], "best", "label"}
         self.photo = None
 
-        self.templates = [(n, p) for n, p in templates if p]
-        self.v_template = tk.StringVar(value=self.templates[0][1] if self.templates else "")
+        self.sets = {n: (list(paths), flip) for n, paths, flip in templates if paths}
+        self.v_template = tk.StringVar(value=next(iter(self.sets), ""))
         self.v_threshold = tk.DoubleVar(value=threshold)
         self._build()
         self.v_template.trace_add("write", lambda *_: self.load_template())
@@ -102,10 +124,11 @@ class ThresholdTool(tk.Toplevel):
         top = ttk.Frame(self, padding=(10, 10, 10, 4))
         top.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Label(top, text="템플릿").pack(side="left")
-        names = [p for _, p in self.templates]
-        ttk.Combobox(top, textvariable=self.v_template, values=names, width=50).pack(side="left", padx=6)
+        self.tpl_combo = ttk.Combobox(top, textvariable=self.v_template, values=list(self.sets), width=40,
+                                      state="readonly")
+        self.tpl_combo.pack(side="left", padx=6)
         ttk.Button(top, text="찾기", width=6, command=self.browse_template).pack(side="left")
-        self.tpl_preview = ttk.Label(top, text="", relief="groove")
+        self.tpl_preview = ttk.Frame(top)
         self.tpl_preview.pack(side="left", padx=10)
         self.tpl_info = ttk.Label(top, text="", foreground="gray")
         self.tpl_info.pack(side="left")
@@ -149,7 +172,7 @@ class ThresholdTool(tk.Toplevel):
         bottom.grid(row=2, column=0, columnspan=2, sticky="ew")
         bottom.columnconfigure(1, weight=1)
         ttk.Label(bottom, text="일치 기준").grid(row=0, column=0, sticky="w")
-        ttk.Scale(bottom, from_=0.5, to=1.0, variable=self.v_threshold,
+        ttk.Scale(bottom, from_=0.2, to=1.0, variable=self.v_threshold,
                   command=lambda v: self.on_threshold()).grid(row=0, column=1, sticky="ew", padx=6)
         self.th_label = ttk.Label(bottom, width=5)
         self.th_label.grid(row=0, column=2)
@@ -166,27 +189,39 @@ class ThresholdTool(tk.Toplevel):
     # ---------- 템플릿 ----------
 
     def browse_template(self):
-        path = filedialog.askopenfilename(parent=self, initialdir=macro.BASE_DIR / "images",
-                                          filetypes=[("이미지", "*.png *.jpg *.bmp"), ("모든 파일", "*.*")])
-        if path:
-            self.v_template.set(path)
+        paths = filedialog.askopenfilenames(parent=self, initialdir=macro.BASE_DIR / "images",
+                                            filetypes=[("이미지", "*.png *.jpg *.bmp"), ("모든 파일", "*.*")])
+        if paths:
+            name = Path(paths[0]).name if len(paths) == 1 else f"직접 고름 ({len(paths)}장)"
+            self.sets[name] = (list(paths), False)
+            self.tpl_combo.config(values=list(self.sets))
+            self.v_template.set(name)
 
     def load_template(self):
-        self.template = None
-        self.tpl_preview.config(image="", text="")
-        path = self.v_template.get().strip()
-        if path:
-            full = (macro.BASE_DIR / path).resolve()
-            try:
-                self.template = macro.load_image(full)
-                self._tpl_photo, _ = to_photo(read_color(full), 120, 60)
-                self.tpl_preview.config(image=self._tpl_photo)
-                h, w = self.template.shape
-                self.tpl_info.config(text=f"{w}x{h}")
-            except (macro.MacroError, ValueError) as e:
-                self.tpl_info.config(text=str(e))
-        else:
-            self.tpl_info.config(text="템플릿 이미지를 고르세요")
+        self.templates = []
+        for child in self.tpl_preview.winfo_children():
+            child.destroy()
+        paths, flip = self.sets.get(self.v_template.get(), ([], False))
+        self._tpl_photos = []
+        try:
+            for p in paths:
+                full = (macro.BASE_DIR / p).resolve()
+                t = macro.load_template(full)
+                self.templates += [t, t.flipped()] if flip else [t]
+                if len(self._tpl_photos) < 8:
+                    photo = bgra_to_photo(read_unchanged(full), 60, 50)
+                    self._tpl_photos.append(photo)
+                    ttk.Label(self.tpl_preview, image=photo, relief="groove").pack(side="left", padx=1)
+            self.templates = [t.scaled(self.scale) for t in self.templates]
+            info = f"{len(self.templates)}장" + (" (반전 포함)" if flip else "")
+            if any(t.mask is not None for t in self.templates):
+                info += ", 투명 부분 제외"
+            if self.scale != 1:
+                info += f", 검색 배율 {self.scale:g}"
+            self.tpl_info.config(text=info if self.templates else "템플릿 이미지를 고르세요")
+        except (macro.MacroError, ValueError) as e:
+            self.templates = []
+            self.tpl_info.config(text=str(e))
         for s in self.samples:
             self._score(s)
         self.refresh()
@@ -194,16 +229,15 @@ class ThresholdTool(tk.Toplevel):
     # ---------- 테스트 이미지 ----------
 
     def _score(self, s):
-        """템플릿과의 매칭 결과(res)와 최고점수 계산."""
-        s["res"], s["best"] = None, None
-        t = self.template
-        if t is None or t.shape[0] > s["gray"].shape[0] or t.shape[1] > s["gray"].shape[1]:
-            return
-        s["res"] = cv2.matchTemplate(s["gray"], t, cv2.TM_CCOEFF_NORMED)
-        s["best"] = float(s["res"].max())
+        """템플릿마다 매칭 결과와 전체 최고점수 계산."""
+        s["res"] = [(t, r) for t in self.templates if (r := t.match(s["gray"])) is not None]
+        s["best"] = max((float(r.max()) for _, r in s["res"]), default=None)
 
     def _add_sample(self, path, color):
-        s = {"path": Path(path), "color": color, "gray": cv2.cvtColor(color, cv2.COLOR_BGR2GRAY), "label": None}
+        gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+        if self.scale != 1:
+            gray = cv2.resize(gray, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
+        s = {"path": Path(path), "color": color, "gray": gray, "label": None}
         self._score(s)
         self.samples.append(s)
         self.refresh(select=len(self.samples) - 1)
@@ -268,10 +302,12 @@ class ThresholdTool(tk.Toplevel):
     # ---------- 표시 ----------
 
     def _matches(self, s):
-        if s["res"] is None:
-            return []
-        th, tw = self.template.shape
-        return macro.find_peaks(s["res"].copy(), tw, th, self.v_threshold.get(), MAX_MARKS)
+        """현재 기준에서 잡히는 [(중심좌표, 점수, 템플릿)] - 검색 배율 적용된 좌표."""
+        peaks = []
+        for t, res in s["res"]:
+            th, tw = t.shape
+            peaks += [(c, sc, t) for c, sc in macro.find_peaks(res.copy(), tw, th, self.v_threshold.get(), MAX_MARKS)]
+        return macro.merge_peaks(peaks, MAX_MARKS)
 
     def on_threshold(self):
         self.th_label.config(text=f"{self.v_threshold.get():.2f}")
@@ -305,17 +341,20 @@ class ThresholdTool(tk.Toplevel):
         s = self.samples[i]
         img = s["color"].copy()
         matches = self._matches(s)
-        if self.template is not None:
-            th, tw = self.template.shape
-            for k, ((cx, cy), score) in enumerate(matches):
-                x0, y0 = cx - tw // 2, cy - th // 2
-                cv2.rectangle(img, (x0, y0), (x0 + tw, y0 + th), (0, 200, 0), 3 if k == 0 else 2)
-                cv2.putText(img, f"{score:.2f}", (x0, max(12, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            if not matches and s["res"] is not None:
-                # 기준 미달이면 가장 비슷한 위치를 빨간 박스로 표시
-                _, score, _, (x0, y0) = cv2.minMaxLoc(s["res"])
-                cv2.rectangle(img, (x0, y0), (x0 + tw, y0 + th), (0, 0, 220), 1)
-                cv2.putText(img, f"best {score:.2f}", (x0, max(12, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        k = 1 / self.scale  # 검색 배율 좌표 → 원본 좌표
+        for n, ((cx, cy), score, t) in enumerate(matches):
+            th, tw = t.shape
+            x0, y0 = round((cx - tw // 2) * k), round((cy - th // 2) * k)
+            cv2.rectangle(img, (x0, y0), (x0 + round(tw * k), y0 + round(th * k)), (0, 200, 0), 3 if n == 0 else 2)
+            cv2.putText(img, f"{score:.2f}", (x0, max(12, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        if not matches and s["res"]:
+            # 기준 미달이면 가장 비슷한 위치를 빨간 박스로 표시
+            t, res = max(s["res"], key=lambda tr: tr[1].max())
+            _, score, _, (x0, y0) = cv2.minMaxLoc(res)
+            th, tw = t.shape
+            x0, y0 = round(x0 * k), round(y0 * k)
+            cv2.rectangle(img, (x0, y0), (x0 + round(tw * k), y0 + round(th * k)), (0, 0, 220), 1)
+            cv2.putText(img, f"best {score:.2f}", (x0, max(12, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         self.photo, _ = to_photo(img, max(c.winfo_width(), 50), max(c.winfo_height(), 50))
         c.create_image(c.winfo_width() // 2, c.winfo_height() // 2, image=self.photo)
         status = f"기준 {self.v_threshold.get():.2f}에서 {len(matches)}개 잡힘 (초록)" if matches else \
@@ -341,14 +380,14 @@ def main():
     regions = cfg.get("regions") or ([cfg["region"]] if cfg.get("region") else [])
     templates = []
     for r in cfg.get("rules", []):
-        for key in ("trigger", "target"):
-            if r.get(key):
-                templates.append((f"{r.get('name', '')} {key}", r[key]))
-        templates += [(f"{r.get('name', '')} alarm", a) for a in macro.rule_alarm_paths(r)]
-    templates += [(a.get("name", ""), a["image"]) for a in cfg.get("alarms", [])]
-    seen = set()
-    templates = [t for t in templates if not (t[1] in seen or seen.add(t[1]))]
-    tool = ThresholdTool(root, templates=templates, regions=regions)
+        name = r.get("name", "")
+        if r.get("trigger"):
+            templates.append((f"{name} 트리거", [r["trigger"]], False))
+        if macro.rule_targets(r):
+            templates.append((f"{name} 타깃 ({len(macro.rule_targets(r))}장)", macro.rule_targets(r), bool(r.get("flip"))))
+        templates += [(f"{name} 알람 {Path(a).name}", [a], False) for a in macro.rule_alarm_paths(r)]
+    templates += [(f"알람 {a.get('name', '')}", [a["image"]], False) for a in cfg.get("alarms", [])]
+    tool = ThresholdTool(root, templates=templates, regions=regions, scale=float(cfg.get("scale", 1.0)))
     tool.protocol("WM_DELETE_WINDOW", root.destroy)
     tool.bind("<Destroy>", lambda e: root.destroy() if e.widget is tool else None)
     root.mainloop()

@@ -17,3 +17,10 @@ tests/
 
 # DD 샘플 (개인 경로 포함)
 dll_button.py
+
+# 게임 리소스 원본과 추출한 프레임 (agf_extract.py)
+*.AGF
+*.agf
+agf_frames/
+agf/
+images/agf/

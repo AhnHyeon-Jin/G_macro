@@ -20,9 +20,11 @@ from pynput import keyboard
 import macro  # DPI 설정이 Tk 창보다 먼저 적용되도록 가장 먼저 import
 import capture
 import tune
+from agf_panel import AgfPanel
 from overlay import COLORS, MAX_OVERLAYS, Overlay
 
 KEY_CHOICES = [f"f{i}" for i in range(1, 13)]
+SCALE_CHOICES = ("1", "0.75", "0.5")
 IMAGES_DIR = macro.BASE_DIR / "images"
 PREVIEW_MAX = 160
 RULE_ALARM_SLOTS = 2  # 규칙 편집 창의 알람 이미지 칸 수
@@ -46,6 +48,20 @@ def parse_number(text, kind, label, minimum=None):
     if minimum is not None and value < minimum:
         raise ValueError(f"'{label}'은(는) {minimum} 이상이어야 합니다.")
     return value
+
+
+def target_summary(rule):
+    """규칙 목록에 보일 타깃 요약."""
+    targets = macro.rule_targets(rule)
+    text = targets[0] if len(targets) == 1 else f"{len(targets)}장 ({Path(targets[0]).parent.name}/...)" if targets else ""
+    return text + (" + 반전" if rule.get("flip") else "")
+
+
+def threshold_summary(rule):
+    """규칙 목록의 기준 열: 타깃 기준이 따로 있으면 '트리거/타깃'."""
+    th = rule.get("threshold", 0.85)
+    tt = rule.get("target_threshold", th)
+    return f"{th}" if tt == th else f"{th}/{tt}"
 
 
 def default_region():
@@ -110,34 +126,42 @@ class ImageFieldsMixin:
             label.config(image="", text="(미리보기를 표시할 수 없는 형식)")
             label.image = None
 
-    def _add_threshold_row(self, frm, row):
-        ttk.Label(frm, text="일치 기준").grid(row=row, column=0, sticky="w", pady=(10, 3))
+    def _add_threshold_row(self, frm, row, var=None, text="일치 기준", templates=None):
+        """기준 슬라이더 + 점수 테스트 버튼. templates: 점수 테스트에 넘길 템플릿 묶음을 돌려주는 함수."""
+        var = var or self.v_threshold
+        ttk.Label(frm, text=text).grid(row=row, column=0, sticky="w", pady=(10, 3))
         th_frm = ttk.Frame(frm)
         th_frm.grid(row=row, column=1, columnspan=3, sticky="ew", pady=(10, 3))
         th_label = ttk.Label(th_frm, width=5)
-        ttk.Scale(th_frm, from_=0.5, to=1.0, variable=self.v_threshold,
+        ttk.Scale(th_frm, from_=0.2, to=1.0, variable=var,
                   command=lambda v: th_label.config(text=f"{float(v):.2f}")).pack(side="left", fill="x", expand=True)
         th_label.pack(side="left", padx=(6, 0))
-        th_label.config(text=f"{self.v_threshold.get():.2f}")
-        self.th_label = th_label
-        ttk.Button(th_frm, text="점수 테스트", command=self.open_tuner).pack(side="left", padx=(8, 0))
+        th_label.config(text=f"{var.get():.2f}")
+        ttk.Button(th_frm, text="점수 테스트",
+                   command=lambda: self.open_tuner(var, th_label, templates or self._tune_templates)).pack(
+            side="left", padx=(8, 0))
 
-    def open_tuner(self):
+    def open_tuner(self, var, th_label, templates):
         """테스트 이미지로 매칭 점수를 보고 일치 기준을 정하는 창."""
         app = self.app
+
+        def apply(value):
+            var.set(value)
+            th_label.config(text=f"{value:.2f}")
+
         tool = tune.ThresholdTool(
-            self, templates=[(k, v.get().strip()) for k, v in self.image_vars.items()],
-            threshold=self.v_threshold.get(), regions=[o.region for o in app.overlays],
-            hide_windows=lambda: [self, app.root] + app.overlays, on_apply=self._set_threshold)
+            self, templates=templates(), scale=app.current_scale(),
+            threshold=var.get(), regions=[o.region for o in app.overlays],
+            hide_windows=lambda: [self, app.root] + app.overlays, on_apply=apply)
         tool.transient(self)
         tool.grab_set()
         self.wait_window(tool)
         if self.winfo_exists():
             self.grab_set()
 
-    def _set_threshold(self, value):
-        self.v_threshold.set(value)
-        self.th_label.config(text=f"{value:.2f}")
+    def _tune_templates(self):
+        """점수 테스트에서 고를 템플릿 묶음 [(이름, [경로], 반전)]."""
+        return [(k, [v.get().strip()], False) for k, v in self.image_vars.items() if v.get().strip()]
 
     def _add_ok_cancel(self, frm, row):
         btn_frm = ttk.Frame(frm)
@@ -162,10 +186,13 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
         offset = macro.offset_ranges(rule)
         self.v_name = tk.StringVar(value=rule.get("name", ""))
         self.v_trigger = tk.StringVar(value=rule.get("trigger", ""))
-        self.v_target = tk.StringVar(value=rule.get("target", ""))
+        self.targets = list(macro.rule_targets(rule))
+        self.v_flip = tk.BooleanVar(value=bool(rule.get("flip")))
+        self.sel_target = None
         alarms = macro.rule_alarm_paths(rule)
         self.v_alarms = [tk.StringVar(value=alarms[i] if i < len(alarms) else "") for i in range(RULE_ALARM_SLOTS)]
         self.v_threshold = tk.DoubleVar(value=rule.get("threshold", 0.85))
+        self.v_target_threshold = tk.DoubleVar(value=rule.get("target_threshold", rule.get("threshold", 0.85)))
         self.v_off = [(tk.StringVar(value=str(lo)), tk.StringVar(value=str(hi))) for lo, hi in offset]  # X, Y
         self.v_cooldown = tk.StringVar(value=str(rule["cooldown"]) if "cooldown" in rule else "")
         hold = rule.get("hold", macro.DEFAULT_HOLD)
@@ -184,7 +211,7 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
         ttk.Entry(frm, textvariable=self.v_name, width=40).grid(row=0, column=1, columnspan=3, sticky="ew")
 
         self._add_image_row(frm, 1, "트리거 이미지", self.v_trigger, "trigger")
-        self._add_image_row(frm, 3, "타깃 이미지 (우클릭)", self.v_target, "target")
+        self._add_target_rows(frm, 3)
         for i, var in enumerate(self.v_alarms):
             self._add_image_row(frm, 5 + i * 2, f"알람 이미지 {i + 1} (선택)", var, f"alarm{i + 1}")
 
@@ -201,11 +228,12 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
                        "알람 이미지 중 하나라도 적용 오버레이에 보이면 경고음을 울리고 매크로를 정지합니다.",
                   foreground="gray").grid(row=11, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
-        self._add_threshold_row(frm, 12)
+        self._add_threshold_row(frm, 12, text="트리거·알람 기준", templates=self._trigger_templates)
+        self._add_threshold_row(frm, 13, self.v_target_threshold, "타깃 기준", self._target_templates)
 
-        ttk.Label(frm, text="클릭 위치 보정").grid(row=13, column=0, sticky="w", pady=3)
+        ttk.Label(frm, text="클릭 위치 보정").grid(row=14, column=0, sticky="w", pady=3)
         off_frm = ttk.Frame(frm)
-        off_frm.grid(row=13, column=1, columnspan=3, sticky="w")
+        off_frm.grid(row=14, column=1, columnspan=3, sticky="w")
         for axis, (v_min, v_max) in zip("XY", self.v_off):
             ttk.Label(off_frm, text=axis).pack(side="left", padx=(0 if axis == "X" else 12, 2))
             ttk.Entry(off_frm, textvariable=v_min, width=5).pack(side="left")
@@ -214,13 +242,13 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
         ttk.Label(off_frm, text="타깃 가운데 기준 픽셀, 범위에서 랜덤 (X+ 오른쪽, Y+ 아래)",
                   foreground="gray").pack(side="left", padx=6)
 
-        ttk.Label(frm, text="클릭 횟수").grid(row=15, column=0, sticky="w", pady=3)
-        ttk.Spinbox(frm, from_=1, to=100, textvariable=self.v_clicks, width=6).grid(row=15, column=1, sticky="w")
+        ttk.Label(frm, text="클릭 횟수").grid(row=16, column=0, sticky="w", pady=3)
+        ttk.Spinbox(frm, from_=1, to=100, textvariable=self.v_clicks, width=6).grid(row=16, column=1, sticky="w")
 
         for r, label, (v_min, v_max), hint in (
-            (14, "반응 대기(초)", self.v_delay, "발견 후 랜덤하게 기다렸다가 다시 확인하고 클릭 (0 = 바로)"),
-            (16, "누르는 시간(초)", self.v_hold, "누른 뒤 이 범위에서 랜덤하게 기다렸다가 뗌"),
-            (17, "클릭 간격(초)", self.v_gap, "여러 번 클릭할 때 뗀 뒤 다음 누르기까지"),
+            (15, "반응 대기(초)", self.v_delay, "발견 후 랜덤하게 기다렸다가 다시 확인하고 클릭 (0 = 바로)"),
+            (17, "누르는 시간(초)", self.v_hold, "누른 뒤 이 범위에서 랜덤하게 기다렸다가 뗌"),
+            (18, "클릭 간격(초)", self.v_gap, "여러 번 클릭할 때 뗀 뒤 다음 누르기까지"),
         ):
             ttk.Label(frm, text=label).grid(row=r, column=0, sticky="w", pady=3)
             rng = ttk.Frame(frm)
@@ -230,33 +258,119 @@ class RuleDialog(ImageFieldsMixin, tk.Toplevel):
             ttk.Entry(rng, textvariable=v_max, width=6).pack(side="left")
             ttk.Label(rng, text=hint, foreground="gray").pack(side="left", padx=6)
 
-        ttk.Label(frm, text="쿨다운(초)").grid(row=18, column=0, sticky="w", pady=3)
+        ttk.Label(frm, text="쿨다운(초)").grid(row=19, column=0, sticky="w", pady=3)
         cd_frm = ttk.Frame(frm)
-        cd_frm.grid(row=18, column=1, columnspan=3, sticky="w")
+        cd_frm.grid(row=19, column=1, columnspan=3, sticky="w")
         ttk.Entry(cd_frm, textvariable=self.v_cooldown, width=8).pack(side="left")
         ttk.Label(cd_frm, text="비우면 설정 탭의 기본값 사용", foreground="gray").pack(side="left", padx=6)
 
-        self._add_ok_cancel(frm, 19)
+        self._add_ok_cancel(frm, 20)
         self.grab_set()
 
     def _capture_index(self):
         # 체크된 첫 번째 오버레이 영역에서 캡처
         return next((i for i, v in enumerate(self.v_ovs) if v.get()), 0)
 
+    def _add_target_rows(self, frm, row):
+        ttk.Label(frm, text="타깃 이미지 (우클릭)").grid(row=row, column=0, sticky="nw", pady=(10, 3))
+        self.target_strip = ttk.Frame(frm, relief="groove", padding=4)
+        self.target_strip.grid(row=row, column=1, sticky="ew", pady=(10, 3))
+        btns = ttk.Frame(frm)
+        btns.grid(row=row, column=2, columnspan=2, sticky="n", padx=(4, 0), pady=(10, 3))
+        ttk.Button(btns, text="추가 (여러 장)", command=self.add_targets).pack(fill="x")
+        ttk.Button(btns, text="화면 캡처", command=self.capture_target).pack(fill="x", pady=2)
+        ttk.Button(btns, text="선택 삭제", command=self.remove_target).pack(fill="x")
+        opt = ttk.Frame(frm)
+        opt.grid(row=row + 1, column=1, columnspan=3, sticky="w")
+        ttk.Checkbutton(opt, text="좌우 반전 이미지도 사용", variable=self.v_flip).pack(side="left")
+        self.target_info = ttk.Label(opt, foreground="gray")
+        self.target_info.pack(side="left", padx=8)
+        self._draw_targets()
+
+    def _draw_targets(self):
+        for child in self.target_strip.winfo_children():
+            child.destroy()
+        self._target_photos = []
+        if not self.targets:
+            ttk.Label(self.target_strip, text="(타깃 이미지를 추가하세요. 몬스터 방향별로 여러 장 가능)",
+                      foreground="gray").grid(row=0, column=0, pady=10)
+        masked = 0
+        for k, path in enumerate(self.targets):
+            try:
+                img = tune.read_unchanged(macro.BASE_DIR / path)
+                masked += img.ndim == 3 and img.shape[2] == 4 and bool((img[:, :, 3] < 255).any())
+                photo = tune.bgra_to_photo(img, 64, 64)
+                self._target_photos.append(photo)
+                label = tk.Label(self.target_strip, image=photo, text=Path(path).name, compound="top",
+                                 font=("맑은 고딕", 8), bd=2, relief="solid" if k == self.sel_target else "flat")
+            except ValueError:
+                label = tk.Label(self.target_strip, text=f"(읽기 실패)\n{Path(path).name}", fg="#c62828", bd=2,
+                                 relief="solid" if k == self.sel_target else "flat")
+            label.grid(row=k // 6, column=k % 6, padx=2, pady=2)
+            label.bind("<Button-1>", lambda e, k=k: self._select_target(k))
+        info = f"{len(self.targets)}장" if self.targets else ""
+        if masked:
+            info += f" · 투명 PNG {masked}장은 투명 부분 제외하고 비교"
+        self.target_info.config(text=info)
+
+    def _select_target(self, k):
+        self.sel_target = k
+        self._draw_targets()
+
+    def add_targets(self):
+        paths = filedialog.askopenfilenames(
+            parent=self, initialdir=IMAGES_DIR, filetypes=[("이미지", "*.png *.jpg *.bmp"), ("모든 파일", "*.*")])
+        for p in paths:
+            if rel_path(p) not in self.targets:
+                self.targets.append(rel_path(p))
+        self._draw_targets()
+
+    def capture_target(self):
+        name = self.v_name.get().strip() or "rule"
+        path = self.app.capture_image(self, f"{name}_target{len(self.targets) + 1}", self._capture_index())
+        if path and path not in self.targets:
+            self.targets.append(path)
+            self._draw_targets()
+
+    def remove_target(self):
+        if self.sel_target is not None and self.sel_target < len(self.targets):
+            del self.targets[self.sel_target]
+            self.sel_target = None
+            self._draw_targets()
+
+    def _trigger_templates(self):
+        return super()._tune_templates()  # 트리거 + 알람 이미지
+
+    def _target_templates(self):
+        sets = []
+        if self.targets:
+            sets.append((f"타깃 전체 ({len(self.targets)}장{' + 반전' if self.v_flip.get() else ''})",
+                         list(self.targets), self.v_flip.get()))
+        if len(self.targets) > 1:
+            sets += [(f"타깃 {Path(p).name}", [p], False) for p in self.targets]
+        return sets
+
     def ok(self):
         try:
-            trigger, target = self.v_trigger.get().strip(), self.v_target.get().strip()
-            for label, p in (("트리거", trigger), ("타깃", target)):
-                if not p:
-                    raise ValueError(f"{label} 이미지를 지정하세요.")
+            trigger = self.v_trigger.get().strip()
+            if not trigger:
+                raise ValueError("트리거 이미지를 지정하세요.")
+            if not self.targets:
+                raise ValueError("타깃 이미지를 하나 이상 추가하세요.")
+            for label, p in [("트리거", trigger)] + [("타깃", t) for t in self.targets]:
                 if not (macro.BASE_DIR / p).is_file():
                     raise ValueError(f"{label} 이미지 파일이 없습니다: {p}")
             rule = {
-                "name": self.v_name.get().strip() or Path(target).stem,
+                "name": self.v_name.get().strip() or Path(self.targets[0]).stem,
                 "trigger": trigger,
-                "target": target,
+                # 한 장이면 예전처럼 문자열로 저장
+                "target": self.targets[0] if len(self.targets) == 1 else list(self.targets),
                 "threshold": round(self.v_threshold.get(), 2),
             }
+            if round(self.v_target_threshold.get(), 2) != rule["threshold"]:
+                rule["target_threshold"] = round(self.v_target_threshold.get(), 2)
+            if self.v_flip.get():
+                rule["flip"] = True
             offset = []
             for axis, (v_min, v_max) in zip("XY", self.v_off):
                 lo = parse_number(v_min.get(), int, f"보정 {axis} 최소")
@@ -346,7 +460,7 @@ class App:
         self.hotkeys = (None, None)
 
         root.title("G_macro" + (" (관리자)" if macro.is_admin() else ""))
-        root.minsize(620, 520)
+        root.minsize(760, 600)
         self._build()
         self.overlays = []
         self.v_regions = []  # 오버레이별 [X, Y, W, H] StringVar
@@ -383,6 +497,8 @@ class App:
         nb = ttk.Notebook(paned)
         nb.add(self._build_rules_tab(nb), text="규칙")
         nb.add(self._build_alarms_tab(nb), text="알람")
+        self.agf_panel = AgfPanel(nb, self)
+        nb.add(self.agf_panel, text="AGF")
         nb.add(self._build_settings_tab(nb), text="설정")
         paned.add(nb, weight=3)
         paned.add(self._build_log(paned), weight=2)
@@ -394,7 +510,7 @@ class App:
 
         cols = ("name", "trigger", "target", "alarm", "overlays", "clicks", "threshold")
         self.tree = ttk.Treeview(frm, columns=cols, show="headings", selectmode="browse", height=6)
-        for col, text, width in zip(cols, ("이름", "트리거", "타깃", "알람", "오버레이", "횟수", "기준"), (100, 140, 140, 120, 60, 40, 50)):
+        for col, text, width in zip(cols, ("이름", "트리거", "타깃", "알람", "오버레이", "횟수", "기준"), (100, 140, 140, 110, 60, 40, 70)):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, stretch=col not in ("overlays", "clicks", "threshold"))
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -461,7 +577,14 @@ class App:
                   foreground="gray").grid(row=2, column=1, sticky="w")
 
         row_label(3, "검사 주기(초)")
-        ttk.Entry(frm, textvariable=self.v_interval, width=8).grid(row=3, column=1, sticky="w")
+        iv = ttk.Frame(frm)
+        iv.grid(row=3, column=1, sticky="w")
+        ttk.Entry(iv, textvariable=self.v_interval, width=8).pack(side="left")
+        ttk.Label(iv, text="검색 배율").pack(side="left", padx=(16, 4))
+        self.v_scale = tk.StringVar()
+        ttk.Combobox(iv, textvariable=self.v_scale, values=SCALE_CHOICES, width=5).pack(side="left")
+        ttk.Label(iv, text="1 = 원본, 0.5 = 절반 크기로 찾음 (약 4배 빠름, 작은 이미지는 덜 정확)",
+                  foreground="gray").pack(side="left", padx=6)
         row_label(4, "기본 쿨다운(초)")
         ttk.Entry(frm, textvariable=self.v_cooldown, width=8).grid(row=4, column=1, sticky="w")
 
@@ -518,6 +641,7 @@ class App:
         self._toggle_overlay()
         self._rebuild_overlay_rows()
         self.v_interval.set(str(cfg.get("interval", 0.2)))
+        self.v_scale.set(f"{float(cfg.get('scale', 1.0)):g}")
         self.v_cooldown.set(str(cfg.get("cooldown", 1.0)))
         self.v_return.set(bool(cfg.get("return_cursor")))
         self.v_debug.set(bool(cfg.get("debug")))
@@ -527,6 +651,7 @@ class App:
         self.v_stop_key.set(cfg.get("stop_key") or "f12")
         self._refresh_tree()
         self._refresh_alarm_tree()
+        self.agf_panel.load_state(cfg.get("agf"))
 
     def collect_config(self):
         """화면 값을 검증해 config dict로. 잘못된 값이면 ValueError."""
@@ -535,6 +660,9 @@ class App:
         cfg["regions"] = [list(o.region) for o in self.overlays]
         cfg["overlay"] = self.v_overlay.get()
         cfg["interval"] = parse_number(self.v_interval.get(), float, "검사 주기", 0.01)
+        cfg["scale"] = parse_number(self.v_scale.get(), float, "검색 배율", 0.1)
+        if cfg["scale"] > 1:
+            raise ValueError("검색 배율은 1 이하로 지정하세요.")
         cfg["cooldown"] = parse_number(self.v_cooldown.get(), float, "기본 쿨다운", 0)
         cfg["return_cursor"] = self.v_return.get()
         cfg["debug"] = self.v_debug.get()
@@ -548,6 +676,11 @@ class App:
             raise ValueError("시작과 정지 단축키가 같습니다.")
         cfg["rules"] = copy.deepcopy(self.rules)
         cfg["alarms"] = copy.deepcopy(self.alarms)
+        agf = self.agf_panel.state()
+        if agf:
+            cfg["agf"] = agf
+        else:
+            cfg.pop("agf", None)
         return cfg
 
     # ---------- 오버레이 ----------
@@ -643,13 +776,20 @@ class App:
         self.tree.delete(*self.tree.get_children())
         for i, r in enumerate(self.rules):
             self.tree.insert("", "end", iid=str(i),
-                             values=(r.get("name", ""), r["trigger"], r["target"],
+                             values=(r.get("name", ""), r["trigger"], target_summary(r),
                                      ", ".join(Path(a).name for a in macro.rule_alarm_paths(r)),
                                      ",".join(map(str, r["overlays"])) if r.get("overlays") else "전체",
-                                     r.get("clicks", 1), r.get("threshold", 0.85)))
+                                     r.get("clicks", 1), threshold_summary(r)))
         if select is not None and 0 <= select < len(self.rules):
             self.tree.selection_set(str(select))
             self.tree.see(str(select))
+        self.agf_panel.refresh_rules()
+
+    def current_scale(self):
+        try:
+            return min(max(float(self.v_scale.get()), 0.1), 1.0)
+        except ValueError:
+            return 1.0
 
     def _selected_index(self):
         sel = self.tree.selection()
@@ -866,6 +1006,8 @@ class App:
                     self.start()
                 elif kind == "stop":
                     self.stop()
+                elif kind == "agf":
+                    self.agf_panel.on_event(payload)
                 elif kind == "alarm":
                     self._on_alarm(*payload)
                 elif kind == "ended":

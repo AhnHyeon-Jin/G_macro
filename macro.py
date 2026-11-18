@@ -74,6 +74,7 @@ DEFAULT_CONFIG = {
     "exit_key": None,
     "debug": False,
     "overlay": True,
+    "scale": 1.0,  # 검색 배율. 0.5면 화면·템플릿을 절반으로 줄여서 찾음 (약 4배 빠름)
     "rules": [],
     "alarms": [],  # [{"name", "image", "threshold"}] 어느 오버레이든 보이면 소리 + 매크로 정지 (규칙별 알람은 rules[].alarm)
 }
@@ -126,36 +127,103 @@ def offset_ranges(rule):
     return [sorted(v) if isinstance(v, (list, tuple)) else [v, v] for v in rule.get("offset", [0, 0])]
 
 
-def load_image(path):
+def rule_targets(rule):
+    """규칙의 타깃 이미지 경로 목록. 이전 버전은 문자열 하나로 저장했으므로 둘 다 받음."""
+    target = rule.get("target") or []
+    return [target] if isinstance(target, str) else [t for t in target if t]
+
+
+class Template:
+    """흑백 템플릿. 투명 PNG면 불투명 픽셀만 비교하도록 마스크를 가짐."""
+
+    def __init__(self, gray, mask=None, name=""):
+        self.gray, self.mask, self.name = gray, mask, name
+
+    @property
+    def shape(self):
+        return self.gray.shape
+
+    def flipped(self):
+        mask = None if self.mask is None else self.mask[:, ::-1].copy()
+        return Template(self.gray[:, ::-1].copy(), mask, f"{self.name} (반전)")
+
+    def scaled(self, scale):
+        if scale == 1:
+            return self
+        h, w = self.shape
+        size = (max(1, round(w * scale)), max(1, round(h * scale)))
+        mask = None if self.mask is None else cv2.resize(self.mask, size, interpolation=cv2.INTER_NEAREST)
+        return Template(cv2.resize(self.gray, size, interpolation=cv2.INTER_AREA), mask, self.name)
+
+    def match(self, screen):
+        """matchTemplate 결과. 템플릿이 화면보다 크면 None."""
+        th, tw = self.shape
+        if th > screen.shape[0] or tw > screen.shape[1]:
+            return None
+        res = cv2.matchTemplate(screen, self.gray, cv2.TM_CCOEFF_NORMED, mask=self.mask)
+        if self.mask is not None:
+            # 마스크 매칭은 단색 영역에서 inf/nan이 나올 수 있음
+            res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+        return res
+
+
+def load_template(path):
     """한글 경로도 읽을 수 있도록 imdecode 사용 (cv2.imread는 한글 경로 실패)."""
     full = (BASE_DIR / path).resolve()
     if not full.exists():
         raise MacroError(f"이미지 파일이 없습니다: {full}")
-    img = cv2.imdecode(np.fromfile(str(full), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    img = cv2.imdecode(np.fromfile(str(full), dtype=np.uint8), cv2.IMREAD_UNCHANGED)
     if img is None:
         raise MacroError(f"이미지를 읽을 수 없습니다: {full}")
-    return img
+    mask = None
+    if img.ndim == 3 and img.shape[2] == 4:
+        alpha = img[:, :, 3]
+        if (alpha < 255).any():
+            if not alpha.any():
+                raise MacroError(f"완전히 투명한 이미지입니다: {full}")
+            mask = np.where(alpha > 0, 255, 0).astype(np.uint8)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGRA2GRAY)
+    elif img.ndim == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = img
+    return Template(gray, mask, full.name)
 
 
 def find(screen, template, threshold):
     """화면에서 template을 찾아 (중심좌표, 점수) 반환. 못 찾으면 (None, 점수)."""
-    th, tw = template.shape[:2]
-    if th > screen.shape[0] or tw > screen.shape[1]:
+    res = template.match(screen)
+    if res is None:
         return None, 0.0
-    res = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+    th, tw = template.shape
     _, score, _, loc = cv2.minMaxLoc(res)
     if score < threshold:
         return None, score
     return (loc[0] + tw // 2, loc[1] + th // 2), score
 
 
-def find_all(screen, template, threshold, max_count=50):
-    """화면에서 template과 일치하는 곳을 모두 찾아 [(중심좌표, 점수), ...] 반환 (점수 높은 순)."""
-    th, tw = template.shape[:2]
-    if th > screen.shape[0] or tw > screen.shape[1]:
-        return []
-    res = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
-    return find_peaks(res, tw, th, threshold, max_count)
+def find_all(screen, templates, threshold, max_count=50):
+    """화면에서 templates(여러 장) 중 하나와 일치하는 곳을 모두 찾아 [(중심좌표, 점수, 템플릿), ...] (점수 높은 순).
+    같은 대상이 여러 템플릿에 잡히면 점수가 가장 높은 것 하나만 남김."""
+    peaks = []
+    for t in templates:
+        res = t.match(screen)
+        if res is not None:
+            th, tw = t.shape
+            peaks += [(c, s, t) for c, s in find_peaks(res, tw, th, threshold, max_count)]
+    return merge_peaks(peaks, max_count)
+
+
+def merge_peaks(peaks, max_count=50):
+    """중심끼리 템플릿 크기의 절반보다 가까운 결과는 같은 대상으로 보고 점수 높은 것만 남김."""
+    kept = []
+    for c, s, t in sorted(peaks, key=lambda p: -p[1]):
+        near = min(t.shape) / 2
+        if all((c[0] - k[0][0]) ** 2 + (c[1] - k[0][1]) ** 2 > max(near, min(k[2].shape) / 2) ** 2 for k in kept):
+            kept.append((c, s, t))
+            if len(kept) >= max_count:
+                break
+    return kept
 
 
 def find_peaks(res, tw, th, threshold, max_count=50):
@@ -170,6 +238,14 @@ def find_peaks(res, tw, th, threshold, max_count=50):
         # 같은 대상이 1픽셀 옆에서 또 잡히지 않도록 주변을 지움
         res[max(0, y - th // 2):y + th // 2 + 1, max(0, x - tw // 2):x + tw // 2 + 1] = -1
     return found
+
+
+def load_rule_targets(rule, scale=1.0):
+    """규칙의 타깃 템플릿 목록 (flip이면 좌우 반전도 추가)."""
+    targets = [load_template(p) for p in rule_targets(rule)]
+    if rule.get("flip"):
+        targets += [t.flipped() for t in targets]
+    return [t.scaled(scale) for t in targets]
 
 
 def send_mouse(flags, dx=0, dy=0):
@@ -292,6 +368,8 @@ class Macro:
         self.interval = float(cfg.get("interval", 0.2))
         self.debug = bool(cfg.get("debug", False))
         self.return_cursor = bool(cfg.get("return_cursor", False))
+        self.scale = float(cfg.get("scale", 1.0))
+        scaled = lambda path: load_template(path).scaled(self.scale)  # noqa: E731
 
         with mss.mss() as sct:
             regions = cfg.get("regions") or ([cfg["region"]] if cfg.get("region") else [])
@@ -305,16 +383,18 @@ class Macro:
 
         self.rules = []
         for r in cfg.get("rules", []):
-            name = r.get("name") or r["target"]
+            name = r.get("name") or ", ".join(rule_targets(r))
             # overlays: 적용할 오버레이 번호(1부터). 없으면 전체
             boxes = [i - 1 for i in r.get("overlays") or range(1, len(self.boxes) + 1) if 1 <= i <= len(self.boxes)]
             if not boxes:
                 raise MacroError(f"규칙 '{name}'을(를) 적용할 오버레이가 없습니다 (지정: {r.get('overlays')})")
             self.rules.append({
                 "name": name,
-                "trigger": load_image(r["trigger"]),
-                "target": load_image(r["target"]),
+                "trigger": scaled(r["trigger"]),
+                "targets": load_rule_targets(r, self.scale),
                 "threshold": r.get("threshold", 0.85),
+                # 타깃은 움직이는 몬스터일 수 있어 기준을 따로 둘 수 있음 (없으면 트리거와 같음)
+                "target_threshold": r.get("target_threshold", r.get("threshold", 0.85)),
                 "offset": offset_ranges(r),
                 "clicks": max(1, int(r.get("clicks", 1))),
                 "hold": sorted(r.get("hold", DEFAULT_HOLD)),
@@ -328,7 +408,7 @@ class Macro:
         all_boxes = list(range(len(self.boxes)))
         self.alarms = [{
             "name": a.get("name") or a["image"],
-            "image": load_image(a["image"]),
+            "image": scaled(a["image"]),
             "threshold": a.get("threshold", 0.85),
             "boxes": all_boxes,
         } for a in cfg.get("alarms", [])]
@@ -337,13 +417,16 @@ class Macro:
             for k, path in enumerate(paths, 1):
                 self.alarms.append({
                     "name": f"{rule['name']} 알람{k if len(paths) > 1 else ''}",
-                    "image": load_image(path),
+                    "image": scaled(path),
                     "threshold": rule["threshold"],
                     "boxes": rule["boxes"],
                 })
 
         if not self.rules:
             raise MacroError("규칙이 없습니다. 규칙을 하나 이상 추가하세요.")
+        for rule in self.rules:
+            if not rule["targets"]:
+                raise MacroError(f"규칙 '{rule['name']}'에 타깃 이미지가 없습니다.")
 
         input_mode = cfg.get("input", "sendinput").lower()
         if input_mode == "dd":
@@ -375,7 +458,7 @@ class Macro:
     def run(self):
         for i, b in enumerate(self.boxes, 1):
             self.log(f"검색 영역 {i}: {b['width']}x{b['height']} @ ({b['left']}, {b['top']})")
-        self.log(f"규칙 {len(self.rules)}개")
+        self.log(f"규칙 {len(self.rules)}개" + (f", 검색 배율 {self.scale:g}" if self.scale != 1 else ""))
         # mss 인스턴스는 사용하는 스레드에서 만들어야 함
         with mss.mss() as sct:
             while not self.stop_event.is_set():
@@ -386,7 +469,10 @@ class Macro:
                 time.sleep(self.interval)
 
     def _grab(self, sct, bi):
-        return cv2.cvtColor(np.array(sct.grab(self.boxes[bi])), cv2.COLOR_BGRA2GRAY)
+        gray = cv2.cvtColor(np.array(sct.grab(self.boxes[bi])), cv2.COLOR_BGRA2GRAY)
+        if self.scale != 1:
+            gray = cv2.resize(gray, None, fx=self.scale, fy=self.scale, interpolation=cv2.INTER_AREA)
+        return gray
 
     def _check_boxes(self, sct):
         """오버레이마다 독립적으로: 그 영역만 캡처해서 그 안에서 트리거/타깃을 찾고 그 안을 클릭."""
@@ -441,18 +527,18 @@ class Macro:
             if self.debug:
                 self.log(f"{tag}: 트리거 없음 (점수 {trig_score:.2f})")
             return None
-        targets = find_all(screen, rule["target"], rule["threshold"])
+        targets = find_all(screen, rule["targets"], rule["target_threshold"])
         if not targets:
             if self.debug:
                 self.log(f"{tag}: 트리거 감지, 타깃 없음")
             return None
-        # 검색 영역 가운데(내 캐릭터 위치)와 가장 가까운 타깃 선택
-        box = self.boxes[bi]
-        cx, cy = box["width"] / 2, box["height"] / 2
-        tgt_pos, tgt_score = min(targets, key=lambda t: (t[0][0] - cx) ** 2 + (t[0][1] - cy) ** 2)
-        dist = ((tgt_pos[0] - cx) ** 2 + (tgt_pos[1] - cy) ** 2) ** 0.5
+        # 검색 영역 가운데(내 캐릭터 위치)와 가장 가까운 타깃 선택 (검색 배율 적용된 좌표)
+        cx, cy = screen.shape[1] / 2, screen.shape[0] / 2
+        pos, score, tpl = min(targets, key=lambda t: (t[0][0] - cx) ** 2 + (t[0][1] - cy) ** 2)
+        dist = ((pos[0] - cx) ** 2 + (pos[1] - cy) ** 2) ** 0.5 / self.scale
+        tgt_pos = (round(pos[0] / self.scale), round(pos[1] / self.scale))
         return tgt_pos, (f"트리거 {trig_score:.2f} / 타깃 {len(targets)}개 중 가운데와 최단 {dist:.0f}px "
-                         f"({tgt_score:.2f})")
+                         f"({tpl.name} {score:.2f})")
 
     def _tag(self, rule, bi):
         return f"[{bi + 1}] {rule['name']}" if len(self.boxes) > 1 else rule["name"]
